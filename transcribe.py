@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-transcribe.py — Transcreve vídeos do YouTube usando yt-dlp + faster-whisper
+transcribe.py — Transcreve vídeos do YouTube ou arquivos locais usando yt-dlp + faster-whisper
 
 Uso:
-    python transcribe.py <URL> [opções]
+    python transcribe.py <URL ou arquivo> [opções]
 
 Exemplos:
     python transcribe.py https://youtu.be/xxxxxxxxxxx
+    python transcribe.py video.mp4
     python transcribe.py https://youtu.be/xxxxxxxxxxx --model large-v2
-    python transcribe.py https://youtu.be/xxxxxxxxxxx --output minha_transcricao.txt
+    python transcribe.py video.mp4 --output minha_transcricao.txt
     python transcribe.py https://youtu.be/xxxxxxxxxxx --language en
     python transcribe.py https://youtu.be/xxxxxxxxxxx --threads 8
 """
@@ -23,6 +24,14 @@ import subprocess
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+# Suprime avisos desnecessários do HuggingFace Hub
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+import warnings
+warnings.filterwarnings("ignore", message=".*unauthenticated.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*huggingface_hub.*", category=UserWarning)
 
 
 def _ensure_ffmpeg_in_path():
@@ -40,6 +49,10 @@ def _ensure_ffmpeg_in_path():
                         return
 
 _ensure_ffmpeg_in_path()
+
+
+def is_local_file(source: str) -> bool:
+    return os.path.isfile(source)
 
 
 def get_yt_dlp_cmd():
@@ -79,25 +92,38 @@ def detect_device():
     return "cpu", "int8"
 
 
-def check_dependencies():
-    """Verifica se faster-whisper e yt-dlp estão instalados."""
-    missing = []
+def check_dependencies(need_ytdlp: bool = True):
+    """Verifica se faster-whisper e (opcionalmente) yt-dlp estão instalados."""
+    pip_missing = []
+    system_missing = []
 
     try:
         import faster_whisper
     except ImportError:
-        missing.append("faster-whisper")
+        pip_missing.append("faster-whisper")
 
-    try:
-        result = subprocess.run([get_yt_dlp_cmd(), "--version"], capture_output=True)
-        if result.returncode != 0:
-            missing.append("yt-dlp")
-    except FileNotFoundError:
-        missing.append("yt-dlp")
+    if need_ytdlp:
+        try:
+            result = subprocess.run([get_yt_dlp_cmd(), "--version"], capture_output=True)
+            if result.returncode != 0:
+                pip_missing.append("yt-dlp")
+        except FileNotFoundError:
+            pip_missing.append("yt-dlp")
 
-    if missing:
-        print("❌ Dependências faltando. Instale com:")
-        print(f"   pip install {' '.join(missing)}")
+    import shutil
+    if not shutil.which("ffmpeg"):
+        system_missing.append("ffmpeg")
+
+    if pip_missing:
+        print("❌ Dependências Python faltando. Instale com:")
+        print(f"   pip install {' '.join(pip_missing)}")
+
+    if system_missing:
+        print("❌ ffmpeg não encontrado no sistema.")
+        print("   Instale via winget:  winget install ffmpeg")
+        print("   Após instalar, reinicie o terminal.")
+
+    if pip_missing or system_missing:
         sys.exit(1)
 
 
@@ -155,6 +181,7 @@ def get_video_title(url: str) -> str:
 def transcribe(audio_path: str, model_name: str, language: str, threads: int, fast: bool = False) -> str:
     """Transcreve o áudio com faster-whisper (CTranslate2 + INT8 no CPU)."""
     from faster_whisper import WhisperModel
+    from tqdm import tqdm
 
     device, compute_type = detect_device()
     mode = "rápido (beam=1)" if fast else "preciso (beam=5)"
@@ -164,57 +191,60 @@ def transcribe(audio_path: str, model_name: str, language: str, threads: int, fa
         device=device,
         compute_type=compute_type,
         cpu_threads=threads,
-        num_workers=2,          # paraleliza carregamento de segmentos
+        num_workers=2,
     )
 
     print("🎙️  Transcrevendo...")
     segments, info = model.transcribe(
         audio_path,
         language=language,
-        beam_size=1 if fast else 5,          # beam_size=1 = greedy, ~2x mais rápido
+        beam_size=1 if fast else 5,
         best_of=1 if fast else 5,
-        temperature=0,                        # desativa fallback de temperatura (mais rápido)
-        condition_on_previous_text=False,     # evita re-processar contexto anterior
-        vad_filter=True,                      # pula silêncio automaticamente
+        temperature=0,
+        condition_on_previous_text=False,
+        without_timestamps=True,
+        vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=500),
     )
 
     print(f"   Idioma detectado: {info.language} (confiança: {info.language_probability:.0%})")
 
-    # Consome o gerador mostrando progresso
-    import time
-    duration = info.duration
+    duration = round(info.duration)
     text_parts = []
-    last_print = 0.0
+    current = 0.0
 
-    for seg in segments:
-        text_parts.append(seg.text)
-        pct = seg.end / duration * 100 if duration else 0
-        if pct - last_print >= 10:
-            print(f"   {pct:5.1f}%  [{seg.start:6.1f}s → {seg.end:6.1f}s]  {seg.text[:60].strip()}...")
-            last_print = pct
+    with tqdm(total=duration, unit="s", desc="Progresso", dynamic_ncols=True) as pbar:
+        for seg in segments:
+            text_parts.append(seg.text)
+            elapsed = round(seg.end - current)
+            if elapsed > 0:
+                pbar.update(elapsed)
+            current = seg.end
 
     return "".join(text_parts).strip()
 
 
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcricoes")
+
+
 def save_transcript(text: str, output_path: str):
     """Salva a transcrição em arquivo .txt."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(text)
     print(f"✅ Transcrição salva em: {output_path}")
 
 
 def main():
-    import os
     cpu_count = os.cpu_count() or 4
 
     parser = argparse.ArgumentParser(
-        description="Transcreve vídeos do YouTube com faster-whisper",
+        description="Transcreve vídeos do YouTube ou arquivos locais com faster-whisper",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
 
-    parser.add_argument("url", help="URL do vídeo do YouTube")
+    parser.add_argument("source", help="URL do YouTube ou caminho para arquivo de vídeo/áudio local")
 
     parser.add_argument(
         "--model", "-m",
@@ -232,7 +262,7 @@ def main():
     parser.add_argument(
         "--output", "-o",
         default=None,
-        help="Caminho do arquivo de saída (padrão: usa o título do vídeo)"
+        help="Caminho do arquivo de saída (padrão: usa o título do vídeo ou nome do arquivo)"
     )
 
     parser.add_argument(
@@ -249,30 +279,40 @@ def main():
     )
 
     args = parser.parse_args()
+    local = is_local_file(args.source)
 
-    # 1. Checa dependências
-    check_dependencies()
+    # 1. Checa dependências (yt-dlp só necessário para URLs)
+    check_dependencies(need_ytdlp=not local)
 
     # 2. Define nome do arquivo de saída
     if args.output:
-        output_path = args.output
+        # Caminho absoluto ou relativo explícito é respeitado; nome simples vai para OUTPUT_DIR
+        if os.sep in args.output or "/" in args.output:
+            output_path = args.output
+        else:
+            output_path = os.path.join(OUTPUT_DIR, args.output)
         if not output_path.endswith(".txt"):
             output_path += ".txt"
+    elif local:
+        base = os.path.splitext(os.path.basename(args.source))[0]
+        output_path = os.path.join(OUTPUT_DIR, f"{base}.txt")
     else:
-        title = get_video_title(args.url)
-        output_path = f"{title}.txt"
+        title = get_video_title(args.source)
+        output_path = os.path.join(OUTPUT_DIR, f"{title}.txt")
 
-    # 3. Baixa áudio em diretório temporário
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        audio_path = download_audio(args.url, tmp_dir)
+    # 3. Obtém o áudio e transcreve
+    if local:
+        print(f"📂 Usando arquivo local: {args.source}")
+        text = transcribe(args.source, args.model, args.language, args.threads, args.fast)
+    else:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio_path = download_audio(args.source, tmp_dir)
+            text = transcribe(audio_path, args.model, args.language, args.threads, args.fast)
 
-        # 4. Transcreve
-        text = transcribe(audio_path, args.model, args.language, args.threads, args.fast)
-
-    # 5. Salva resultado
+    # 4. Salva resultado
     save_transcript(text, output_path)
 
-    # 6. Preview
+    # 5. Preview
     print("\n--- Preview ---")
     print(text[:500] + ("..." if len(text) > 500 else ""))
 
