@@ -4,6 +4,8 @@ transcribe.py — Transcreve vídeos do YouTube ou arquivos locais usando yt-dlp
 
 Uso:
     python transcribe.py <URL ou arquivo> [opções]
+    python transcribe.py <URL1> <URL2> <URL3> ...          # lote via CLI
+    python transcribe.py --batch lista.txt                  # lote via arquivo
 
 Exemplos:
     python transcribe.py https://youtu.be/xxxxxxxxxxx
@@ -11,7 +13,8 @@ Exemplos:
     python transcribe.py https://youtu.be/xxxxxxxxxxx --model large-v2
     python transcribe.py video.mp4 --output minha_transcricao.txt
     python transcribe.py https://youtu.be/xxxxxxxxxxx --language en
-    python transcribe.py https://youtu.be/xxxxxxxxxxx --threads 8
+    python transcribe.py URL1 URL2 URL3 --model medium --fast
+    python transcribe.py --batch urls.txt --language en
 """
 
 import argparse
@@ -178,21 +181,25 @@ def get_video_title(url: str) -> str:
     return "transcricao"
 
 
-def transcribe(audio_path: str, model_name: str, language: str, threads: int, fast: bool = False) -> str:
-    """Transcreve o áudio com faster-whisper (CTranslate2 + INT8 no CPU)."""
+def load_model(model_name: str, threads: int, fast: bool):
+    """Carrega o modelo Whisper uma vez para reutilizar em múltiplas transcrições."""
     from faster_whisper import WhisperModel
-    from tqdm import tqdm
 
     device, compute_type = detect_device()
-    mode = "rápido (beam=1)" if fast else "preciso (beam=5)"
+    mode = "rapido (beam=1)" if fast else "preciso (beam=5)"
     print(f"🧠 Carregando modelo '{model_name}' [{device.upper()} / {compute_type}] {threads} threads | modo: {mode}...")
-    model = WhisperModel(
+    return WhisperModel(
         model_name,
         device=device,
         compute_type=compute_type,
         cpu_threads=threads,
         num_workers=2,
     )
+
+
+def transcribe(audio_path: str, model, language: str, fast: bool = False) -> str:
+    """Transcreve o áudio com um modelo faster-whisper já carregado."""
+    from tqdm import tqdm
 
     print("🎙️  Transcrevendo...")
     segments, info = model.transcribe(
@@ -235,6 +242,46 @@ def save_transcript(text: str, output_path: str):
     print(f"✅ Transcrição salva em: {output_path}")
 
 
+def resolve_output_path(source: str, explicit_output: str | None, batch_mode: bool) -> str:
+    """Determina o caminho do arquivo de saída para uma fonte."""
+    if explicit_output and not batch_mode:
+        if os.sep in explicit_output or "/" in explicit_output:
+            path = explicit_output
+        else:
+            path = os.path.join(OUTPUT_DIR, explicit_output)
+        return path if path.endswith(".txt") else path + ".txt"
+
+    if is_local_file(source):
+        base = os.path.splitext(os.path.basename(source))[0]
+        return os.path.join(OUTPUT_DIR, f"{base}.txt")
+
+    title = get_video_title(source)
+    return os.path.join(OUTPUT_DIR, f"{title}.txt")
+
+
+def process_source(source: str, output_path: str, model, language: str, fast: bool):
+    """Baixa (se URL) e transcreve uma única fonte. Retorna True em caso de sucesso."""
+    local = is_local_file(source)
+    try:
+        if local:
+            print(f"\n📂 [{source}] Usando arquivo local")
+            text = transcribe(source, model, language, fast)
+        else:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                audio_path = download_audio(source, tmp_dir)
+                text = transcribe(audio_path, model, language, fast)
+
+        save_transcript(text, output_path)
+        print("\n--- Preview ---")
+        print(text[:500] + ("..." if len(text) > 500 else ""))
+        return True
+    except SystemExit:
+        return False
+    except Exception as exc:
+        print(f"❌ Erro ao processar '{source}': {exc}")
+        return False
+
+
 def main():
     cpu_count = os.cpu_count() or 4
 
@@ -244,7 +291,17 @@ def main():
         epilog=__doc__
     )
 
-    parser.add_argument("source", help="URL do YouTube ou caminho para arquivo de vídeo/áudio local")
+    parser.add_argument(
+        "sources",
+        nargs="*",
+        help="URL(s) do YouTube ou caminho(s) para arquivo(s) local(is). Aceita múltiplos."
+    )
+
+    parser.add_argument(
+        "--batch", "-b",
+        metavar="ARQUIVO",
+        help="Arquivo de texto com uma URL ou caminho por linha (linhas com # são ignoradas)."
+    )
 
     parser.add_argument(
         "--model", "-m",
@@ -262,7 +319,7 @@ def main():
     parser.add_argument(
         "--output", "-o",
         default=None,
-        help="Caminho do arquivo de saída (padrão: usa o título do vídeo ou nome do arquivo)"
+        help="Caminho do arquivo de saída (só válido para fonte única; ignorado em lote)."
     )
 
     parser.add_argument(
@@ -279,42 +336,58 @@ def main():
     )
 
     args = parser.parse_args()
-    local = is_local_file(args.source)
 
-    # 1. Checa dependências (yt-dlp só necessário para URLs)
-    check_dependencies(need_ytdlp=not local)
+    # Consolida lista de fontes
+    all_sources = list(args.sources)
+    if args.batch:
+        if not os.path.isfile(args.batch):
+            print(f"❌ Arquivo de lote não encontrado: {args.batch}")
+            sys.exit(1)
+        with open(args.batch, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    all_sources.append(line)
 
-    # 2. Define nome do arquivo de saída
-    if args.output:
-        # Caminho absoluto ou relativo explícito é respeitado; nome simples vai para OUTPUT_DIR
-        if os.sep in args.output or "/" in args.output:
-            output_path = args.output
+    if not all_sources:
+        parser.print_help()
+        sys.exit(1)
+
+    batch_mode = len(all_sources) > 1
+
+    if args.output and batch_mode:
+        print("⚠️  --output ignorado no modo lote; os nomes são gerados automaticamente.\n")
+
+    # Verifica dependências (yt-dlp se houver alguma URL)
+    has_urls = any(not is_local_file(s) for s in all_sources)
+    check_dependencies(need_ytdlp=has_urls)
+
+    # Carrega o modelo uma única vez para todos os vídeos
+    model = load_model(args.model, args.threads, args.fast)
+
+    ok, failed = 0, []
+
+    for i, source in enumerate(all_sources, 1):
+        if batch_mode:
+            print(f"\n{'='*60}")
+            print(f"[{i}/{len(all_sources)}] {source}")
+            print('='*60)
+
+        output_path = resolve_output_path(source, args.output, batch_mode)
+        success = process_source(source, output_path, model, args.language, args.fast)
+        if success:
+            ok += 1
         else:
-            output_path = os.path.join(OUTPUT_DIR, args.output)
-        if not output_path.endswith(".txt"):
-            output_path += ".txt"
-    elif local:
-        base = os.path.splitext(os.path.basename(args.source))[0]
-        output_path = os.path.join(OUTPUT_DIR, f"{base}.txt")
-    else:
-        title = get_video_title(args.source)
-        output_path = os.path.join(OUTPUT_DIR, f"{title}.txt")
+            failed.append(source)
 
-    # 3. Obtém o áudio e transcreve
-    if local:
-        print(f"📂 Usando arquivo local: {args.source}")
-        text = transcribe(args.source, args.model, args.language, args.threads, args.fast)
-    else:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            audio_path = download_audio(args.source, tmp_dir)
-            text = transcribe(audio_path, args.model, args.language, args.threads, args.fast)
-
-    # 4. Salva resultado
-    save_transcript(text, output_path)
-
-    # 5. Preview
-    print("\n--- Preview ---")
-    print(text[:500] + ("..." if len(text) > 500 else ""))
+    if batch_mode:
+        print(f"\n{'='*60}")
+        print(f"Lote concluído: {ok}/{len(all_sources)} transcrições salvas.")
+        if failed:
+            print("Falhas:")
+            for s in failed:
+                print(f"  - {s}")
+        print('='*60)
 
 
 if __name__ == "__main__":
