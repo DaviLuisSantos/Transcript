@@ -139,7 +139,7 @@ def download_audio(url: str, output_dir: str) -> str:
     cmd = [
         get_yt_dlp_cmd(),
         "--extract-audio",
-        "--audio-format", "wav",   # WAV: faster-whisper lê direto, sem recodificação extra
+        "--audio-format", "m4a",   # m4a: formato nativo do YouTube, remux sem re-encoding
         "--audio-quality", "0",
         "--output", output_template,
         "--no-playlist",
@@ -166,53 +166,93 @@ def download_audio(url: str, output_dir: str) -> str:
     sys.exit(1)
 
 
-def get_video_title(url: str) -> str:
-    """Pega o título do vídeo para usar como nome do arquivo de saída."""
-    cmd = [get_yt_dlp_cmd(), "--get-title", "--no-playlist", url]
+def _sanitize(name: str, max_len: int = 80) -> str:
+    """Remove caracteres inválidos para nomes de arquivo/pasta no Windows."""
+    invalid = r'\/:*?"<>|'
+    for char in invalid:
+        name = name.replace(char, "_")
+    return name[:max_len].strip()
+
+
+def get_video_info(url: str) -> tuple[str, str]:
+    """Retorna (canal, título) do vídeo. Fallbacks seguros em caso de erro."""
+    cmd = [
+        get_yt_dlp_cmd(),
+        "--no-playlist",
+        "--print", "%(channel)s\t%(title)s",
+        url,
+    ]
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode == 0:
-        title = result.stdout.strip()
-        invalid = r'\/:*?"<>|'
-        for char in invalid:
-            title = title.replace(char, "_")
-        return title[:80]
+        parts = result.stdout.strip().split("\t", 1)
+        if len(parts) == 2:
+            channel = _sanitize(parts[0]) or "desconhecido"
+            title = _sanitize(parts[1]) or "transcricao"
+            return channel, title
 
-    return "transcricao"
+    return "desconhecido", "transcricao"
 
 
 def load_model(model_name: str, threads: int, fast: bool):
-    """Carrega o modelo Whisper uma vez para reutilizar em múltiplas transcrições."""
+    """Carrega o modelo Whisper uma vez para reutilizar em múltiplas transcrições.
+
+    Retorna (model, batch_size) onde batch_size é None no modo padrão ou um
+    inteiro quando BatchedInferencePipeline está disponível.
+    """
     from faster_whisper import WhisperModel
 
     device, compute_type = detect_device()
+    num_workers = min(4, os.cpu_count() or 2)
     mode = "rapido (beam=1)" if fast else "preciso (beam=5)"
     print(f"🧠 Carregando modelo '{model_name}' [{device.upper()} / {compute_type}] {threads} threads | modo: {mode}...")
-    return WhisperModel(
+
+    base_model = WhisperModel(
         model_name,
         device=device,
         compute_type=compute_type,
         cpu_threads=threads,
-        num_workers=2,
+        num_workers=num_workers,
     )
 
+    if not fast and device == "cuda":
+        try:
+            from faster_whisper import BatchedInferencePipeline
+            print("   Inferencia em lote ativada (batch_size=16, CUDA)")
+            return BatchedInferencePipeline(model=base_model), 16
+        except ImportError:
+            pass
 
-def transcribe(audio_path: str, model, language: str, fast: bool = False) -> str:
+    return base_model, None
+
+
+def transcribe(audio_path: str, model, language: str, fast: bool = False, batch_size: int | None = None) -> str:
     """Transcreve o áudio com um modelo faster-whisper já carregado."""
     from tqdm import tqdm
 
     print("🎙️  Transcrevendo...")
-    segments, info = model.transcribe(
-        audio_path,
-        language=language,
-        beam_size=1 if fast else 5,
-        best_of=1 if fast else 5,
-        temperature=0,
-        condition_on_previous_text=False,
-        without_timestamps=True,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=500),
-    )
+
+    if batch_size is not None:
+        segments, info = model.transcribe(
+            audio_path,
+            language=language,
+            beam_size=1 if fast else 5,
+            batch_size=batch_size,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
+        )
+    else:
+        segments, info = model.transcribe(
+            audio_path,
+            language=language,
+            beam_size=1 if fast else 5,
+            best_of=1 if fast else 5,
+            temperature=0,
+            condition_on_previous_text=False,
+            without_timestamps=True,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
+        )
 
     print(f"   Idioma detectado: {info.language} (confiança: {info.language_probability:.0%})")
 
@@ -253,23 +293,25 @@ def resolve_output_path(source: str, explicit_output: str | None, batch_mode: bo
 
     if is_local_file(source):
         base = os.path.splitext(os.path.basename(source))[0]
-        return os.path.join(OUTPUT_DIR, f"{base}.txt")
+        return os.path.join(OUTPUT_DIR, "local", f"{base}.txt")
 
-    title = get_video_title(source)
-    return os.path.join(OUTPUT_DIR, f"{title}.txt")
+    channel, title = get_video_info(source)
+    return os.path.join(OUTPUT_DIR, channel, f"{title}.txt")
 
 
-def process_source(source: str, output_path: str, model, language: str, fast: bool):
+def process_source(source: str, output_path: str, model, batch_size: int | None, language: str, fast: bool):
     """Baixa (se URL) e transcreve uma única fonte. Retorna True em caso de sucesso."""
     local = is_local_file(source)
     try:
         if local:
-            print(f"\n📂 [{source}] Usando arquivo local")
-            text = transcribe(source, model, language, fast)
+            print(f"\n📂 Arquivo local: {source}")
+            text = transcribe(source, model, language, fast, batch_size)
         else:
+            channel = os.path.basename(os.path.dirname(output_path))
+            print(f"\n📺 Canal: {channel}")
             with tempfile.TemporaryDirectory() as tmp_dir:
                 audio_path = download_audio(source, tmp_dir)
-                text = transcribe(audio_path, model, language, fast)
+                text = transcribe(audio_path, model, language, fast, batch_size)
 
         save_transcript(text, output_path)
         print("\n--- Preview ---")
@@ -280,6 +322,18 @@ def process_source(source: str, output_path: str, model, language: str, fast: bo
     except Exception as exc:
         print(f"❌ Erro ao processar '{source}': {exc}")
         return False
+
+
+def _remove_from_batch(batch_file: str | None, source: str):
+    """Remove a linha correspondente à fonte do arquivo de lote."""
+    if not batch_file or not os.path.isfile(batch_file):
+        return
+    with open(batch_file, encoding="utf-8") as f:
+        lines = f.readlines()
+    with open(batch_file, "w", encoding="utf-8") as f:
+        for line in lines:
+            if line.strip() != source:
+                f.write(line)
 
 
 def main():
@@ -339,11 +393,12 @@ def main():
 
     # Consolida lista de fontes
     all_sources = list(args.sources)
-    if args.batch:
-        if not os.path.isfile(args.batch):
-            print(f"❌ Arquivo de lote não encontrado: {args.batch}")
+    batch_file = args.batch
+    if batch_file:
+        if not os.path.isfile(batch_file):
+            print(f"❌ Arquivo de lote não encontrado: {batch_file}")
             sys.exit(1)
-        with open(args.batch, encoding="utf-8") as f:
+        with open(batch_file, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):
@@ -363,7 +418,7 @@ def main():
     check_dependencies(need_ytdlp=has_urls)
 
     # Carrega o modelo uma única vez para todos os vídeos
-    model = load_model(args.model, args.threads, args.fast)
+    model, batch_size = load_model(args.model, args.threads, args.fast)
 
     ok, failed = 0, []
 
@@ -374,9 +429,17 @@ def main():
             print('='*60)
 
         output_path = resolve_output_path(source, args.output, batch_mode)
-        success = process_source(source, output_path, model, args.language, args.fast)
+
+        if os.path.isfile(output_path):
+            print(f"⏭️  Já transcrito, ignorando: {output_path}")
+            _remove_from_batch(batch_file, source)
+            ok += 1
+            continue
+
+        success = process_source(source, output_path, model, batch_size, args.language, args.fast)
         if success:
             ok += 1
+            _remove_from_batch(batch_file, source)
         else:
             failed.append(source)
 
