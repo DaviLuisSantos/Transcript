@@ -143,6 +143,7 @@ def download_audio(url: str, output_dir: str) -> str:
         "--audio-quality", "0",
         "--output", output_template,
         "--no-playlist",
+        "--js-runtimes", "node",
     ]
 
     ffmpeg_dir = find_ffmpeg()
@@ -179,6 +180,7 @@ def get_video_info(url: str) -> tuple[str, str]:
     cmd = [
         get_yt_dlp_cmd(),
         "--no-playlist",
+        "--js-runtimes", "node",
         "--print", "%(channel)s\t%(title)s",
         url,
     ]
